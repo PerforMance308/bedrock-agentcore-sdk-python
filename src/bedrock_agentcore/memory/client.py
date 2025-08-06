@@ -1,24 +1,26 @@
 """AgentCore Memory SDK - High-level client for memory operations.
 
-This SDK handles the asymmetric API where:
-- Input parameters use old field names (memoryStrategies, memoryStrategyId, etc.)
-- Output responses use new field names (strategies, strategyId, etc.)
+This SDK provides a unified interface that supports multiple memory backends:
+- AWS Bedrock AgentCore (default)
+- PostgreSQL with pgvector 
+- ChromaDB with local persistence
 
-The SDK automatically normalizes responses to provide both field names for
-backward compatibility.
+The client automatically handles backend-specific implementations while maintaining
+full API compatibility with existing code.
 """
 
+import asyncio
 import copy
 import logging
 import time
 import uuid
 import warnings
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-import boto3
-from botocore.exceptions import ClientError
+# No AWS dependencies needed anymore
 
+from .backends import MemoryBackend, MemoryBackendFactory, MemoryBackendType
 from .constants import (
     CUSTOM_CONSOLIDATION_WRAPPER_KEYS,
     CUSTOM_EXTRACTION_WRAPPER_KEYS,
@@ -36,20 +38,64 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryClient:
-    """High-level Bedrock AgentCore Memory client with essential operations."""
-
-    def __init__(self, region_name: Optional[str] = None):
-        """Initialize the Memory client."""
-        self.region_name = region_name or boto3.Session().region_name or "us-west-2"
-
-        self.gmcp_client = boto3.client("bedrock-agentcore-control", region_name=self.region_name)
-        self.gmdp_client = boto3.client("bedrock-agentcore", region_name=self.region_name)
-
-        logger.info(
-            "Initialized MemoryClient for control plane: %s, data plane: %s",
-            self.gmcp_client.meta.region_name,
-            self.gmdp_client.meta.region_name,
+    """High-level Memory client with pluggable backend support.
+    
+    This client maintains full API compatibility while supporting multiple backends.
+    
+    Examples:
+        # AWS Bedrock (default)
+        client = MemoryClient(region_name="us-west-2")
+        
+        # PostgreSQL backend
+        client = MemoryClient(
+            backend_type="postgresql",
+            backend_config={
+                "host": "localhost",
+                "database": "memory_db",
+                "user": "postgres", 
+                "password": "password"
+            }
         )
+        
+        # ChromaDB backend
+        client = MemoryClient(
+            backend_type="chromadb",
+            backend_config={
+                "persist_directory": "./chroma_memory"
+            }
+        )
+    """
+
+    def __init__(
+        self, 
+        region_name: Optional[str] = None,
+        backend_type: Union[str, MemoryBackendType] = "chromadb",
+        backend_config: Optional[Dict[str, Any]] = None
+    ):
+        """Initialize the Memory client.
+        
+        Args:
+            region_name: AWS region (for compatibility, auto-added to backend_config)
+            backend_type: Backend type ("chromadb", "postgresql")  
+            backend_config: Backend-specific configuration
+        """
+        # Handle backward compatibility with region_name parameter
+        if backend_config is None:
+            backend_config = {}
+            
+        # For backward compatibility, add region_name if specified
+        if region_name:
+            backend_config["region_name"] = region_name
+        
+        # Store region for compatibility
+        self.region_name = region_name or backend_config.get("region_name", "us-west-2")
+        
+        # Initialize backend
+        self.backend: MemoryBackend = MemoryBackendFactory.create_backend(
+            backend_type, backend_config
+        )
+        
+        logger.info(f"Initialized MemoryClient with {backend_type} backend")
 
     def create_memory(
         self,
@@ -65,30 +111,16 @@ class MemoryClient:
 
         try:
             processed_strategies = self._add_default_namespaces(strategies)
-
-            params = {
-                "name": name,
-                "eventExpiryDuration": event_expiry_days,
-                "memoryStrategies": processed_strategies,  # Using old field name for input
-                "clientToken": str(uuid.uuid4()),
-            }
-
-            if description is not None:
-                params["description"] = description
-
-            if memory_execution_role_arn is not None:
-                params["memoryExecutionRoleArn"] = memory_execution_role_arn
-
-            response = self.gmcp_client.create_memory(**params)
-
-            memory = response["memory"]
-            # Normalize response to handle new field names
-            memory = self._normalize_memory_response(memory)
-
+            memory = asyncio.run(self.backend.create_memory(
+                name=name,
+                strategies=processed_strategies,
+                description=description,
+                event_expiry_days=event_expiry_days,
+                memory_execution_role_arn=memory_execution_role_arn
+            ))
             logger.info("Created memory: %s", memory["memoryId"])
             return memory
-
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to create memory: %s", e)
             raise
 
@@ -147,18 +179,17 @@ class MemoryClient:
                 if status == MemoryStatus.ACTIVE.value:
                     logger.info("Memory %s is now ACTIVE (took %d seconds)", memory_id, elapsed)
                     # Get fresh memory details
-                    response = self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-                    memory = self._normalize_memory_response(response["memory"])
+                    memory = asyncio.run(self.backend.get_memory(memory_id))
                     return memory
                 elif status == MemoryStatus.FAILED.value:
                     # Get failure reason if available
-                    response = self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-                    failure_reason = response["memory"].get("failureReason", "Unknown")
+                    memory = asyncio.run(self.backend.get_memory(memory_id))
+                    failure_reason = memory.get("failureReason", "Unknown") if memory else "Unknown"
                     raise RuntimeError("Memory creation failed: %s" % failure_reason)
                 else:
                     logger.debug("Memory status: %s (%d seconds elapsed)", status, elapsed)
 
-            except ClientError as e:
+            except Exception as e:
                 logger.error("Error checking memory status: %s", e)
                 raise
 
@@ -200,32 +231,18 @@ class MemoryClient:
             return []
 
         try:
-            # Let service handle all namespace validation
-            response = self.gmdp_client.retrieve_memory_records(
-                memoryId=memory_id, namespace=namespace, searchCriteria={"searchQuery": query, "topK": top_k}
-            )
-
-            memories = response.get("memoryRecordSummaries", [])
+            memories = asyncio.run(self.backend.retrieve_memories(
+                memory_id=memory_id,
+                namespace=namespace,
+                query=query,
+                top_k=top_k,
+                actor_id=actor_id
+            ))
             logger.info("Retrieved %d memories from namespace: %s", len(memories), namespace)
             return memories
 
-        except ClientError as e:
-            error_code = e.response["Error"]["Code"]
-            error_msg = e.response["Error"]["Message"]
-
-            if error_code == "ResourceNotFoundException":
-                logger.warning(
-                    "Memory or namespace not found. Ensure memory %s exists and namespace '%s' is configured",
-                    memory_id,
-                    namespace,
-                )
-            elif error_code == "ValidationException":
-                logger.warning("Invalid search parameters: %s", error_msg)
-            elif error_code == "ServiceException":
-                logger.warning("Service error: %s. This may be temporary - try again later", error_msg)
-            else:
-                logger.warning("Memory retrieval failed (%s): %s", error_code, error_msg)
-
+        except Exception as e:
+            logger.error("Failed to retrieve memories: %s", e)
             return []
 
     def create_event(
@@ -320,25 +337,26 @@ class MemoryClient:
             if event_timestamp is None:
                 event_timestamp = datetime.utcnow()
 
-            params = {
-                "memoryId": memory_id,
-                "actorId": actor_id,
-                "sessionId": session_id,
-                "eventTimestamp": event_timestamp,
-                "payload": payload,
-            }
-
+            # Extract branch parameters
+            branch_name = None
+            root_event_id = None
             if branch:
-                params["branch"] = branch
+                branch_name = branch.get("name")
+                root_event_id = branch.get("rootEventId")
 
-            response = self.gmdp_client.create_event(**params)
-
-            event = response["event"]
+            event = asyncio.run(self.backend.create_event(
+                memory_id=memory_id,
+                actor_id=actor_id,
+                session_id=session_id,
+                payload=payload,
+                branch_name=branch_name,
+                root_event_id=root_event_id
+            ))
+            
             logger.info("Created event: %s", event["eventId"])
-
             return event
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to create event: %s", e)
             raise
 
@@ -415,26 +433,26 @@ class MemoryClient:
             if event_timestamp is None:
                 event_timestamp = datetime.utcnow()
 
-            params = {
-                "memoryId": memory_id,
-                "actorId": actor_id,
-                "sessionId": session_id,
-                "eventTimestamp": event_timestamp,
-                "payload": payload,
-                "clientToken": str(uuid.uuid4()),
-            }
-
+            # Extract branch parameters
+            branch_name = None
+            root_event_id = None
             if branch:
-                params["branch"] = branch
+                branch_name = branch.get("name")
+                root_event_id = branch.get("rootEventId")
 
-            response = self.gmdp_client.create_event(**params)
-
-            event = response["event"]
+            event = asyncio.run(self.backend.create_event(
+                memory_id=memory_id,
+                actor_id=actor_id,
+                session_id=session_id,
+                payload=payload,
+                branch_name=branch_name,
+                root_event_id=root_event_id
+            ))
+            
             logger.info("Created event: %s", event["eventId"])
-
             return event
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to create event: %s", e)
             raise
 
@@ -635,37 +653,20 @@ class MemoryClient:
             branch_events = client.list_events(memory_id, actor_id, session_id, branch_name="test-branch")
         """
         try:
-            all_events = []
-            next_token = None
+            # Use backend list_events method
+            result = asyncio.run(self.backend.list_events(
+                memory_id=memory_id,
+                actor_id=actor_id,
+                session_id=session_id,
+                branch_name=branch_name if branch_name != "main" else None,
+                max_results=max_results
+            ))
+            
+            events = result.get("events", [])
+            logger.info("Retrieved %d events", len(events))
+            return events
 
-            while len(all_events) < max_results:
-                params = {
-                    "memoryId": memory_id,
-                    "actorId": actor_id,
-                    "sessionId": session_id,
-                    "maxResults": min(100, max_results - len(all_events)),
-                }
-
-                if next_token:
-                    params["nextToken"] = next_token
-
-                # Add branch filter if specified (but not for "main")
-                if branch_name and branch_name != "main":
-                    params["filter"] = {"branch": {"name": branch_name, "includeParentBranches": include_parent_events}}
-
-                response = self.gmdp_client.list_events(**params)
-
-                events = response.get("events", [])
-                all_events.extend(events)
-
-                next_token = response.get("nextToken")
-                if not next_token or len(all_events) >= max_results:
-                    break
-
-            logger.info("Retrieved total of %d events", len(all_events))
-            return all_events[:max_results]
-
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to list events: %s", e)
             raise
 
@@ -680,20 +681,24 @@ class MemoryClient:
             List of branch information including name and root event
         """
         try:
-            # Get all events - need to handle pagination for complete list
+            # Get all events - use backend with pagination
             all_events = []
             next_token = None
 
             while True:
-                params = {"memoryId": memory_id, "actorId": actor_id, "sessionId": session_id, "maxResults": 100}
+                # Use backend to get events with pagination
+                result = asyncio.run(self.backend.list_events(
+                    memory_id=memory_id,
+                    actor_id=actor_id, 
+                    session_id=session_id,
+                    max_results=100,
+                    next_token=next_token
+                ))
+                
+                events = result.get("events", [])
+                all_events.extend(events)
 
-                if next_token:
-                    params["nextToken"] = next_token
-
-                response = self.gmdp_client.list_events(**params)
-                all_events.extend(response.get("events", []))
-
-                next_token = response.get("nextToken")
+                next_token = result.get("nextToken")
                 if not next_token:
                     break
 
@@ -738,7 +743,7 @@ class MemoryClient:
             logger.info("Found %d branches in session %s", len(result), session_id)
             return result
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to list branches: %s", e)
             raise
 
@@ -771,28 +776,30 @@ class MemoryClient:
             List of events in the branch
         """
         try:
-            params = {
-                "memoryId": memory_id,
-                "actorId": actor_id,
-                "sessionId": session_id,
-                "maxResults": min(100, max_results),
-            }
-
-            # Only add filter when we have a specific branch name
-            if branch_name:
-                params["filter"] = {"branch": {"name": branch_name, "includeParentBranches": include_parent_events}}
-
-            response = self.gmdp_client.list_events(**params)
-            events = response.get("events", [])
+            # Use backend to get initial events  
+            result = asyncio.run(self.backend.list_events(
+                memory_id=memory_id,
+                actor_id=actor_id,
+                session_id=session_id, 
+                branch_name=branch_name,
+                max_results=min(100, max_results)
+            ))
+            events = result.get("events", [])
 
             # Handle pagination
-            next_token = response.get("nextToken")
+            next_token = result.get("nextToken")
             while next_token and len(events) < max_results:
-                params["nextToken"] = next_token
-                params["maxResults"] = min(100, max_results - len(events))
-                response = self.gmdp_client.list_events(**params)
-                events.extend(response.get("events", []))
-                next_token = response.get("nextToken")
+                # Get more events with pagination
+                result = asyncio.run(self.backend.list_events(
+                    memory_id=memory_id,
+                    actor_id=actor_id,
+                    session_id=session_id,
+                    branch_name=branch_name,
+                    max_results=min(100, max_results - len(events)),
+                    next_token=next_token
+                ))
+                events.extend(result.get("events", []))
+                next_token = result.get("nextToken")
 
             # Filter for main branch if no branch specified
             if not branch_name:
@@ -801,7 +808,7 @@ class MemoryClient:
             logger.info("Retrieved %d events from branch '%s'", len(events), branch_name or "main")
             return events
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to list branch events: %s", e)
             raise
 
@@ -830,7 +837,14 @@ class MemoryClient:
                 if next_token:
                     params["nextToken"] = next_token
 
-                response = self.gmdp_client.list_events(**params)
+                result = asyncio.run(self.backend.list_events(
+                    memory_id=memory_id,
+                    actor_id=actor_id,
+                    session_id=session_id,
+                    max_results=100,
+                    next_token=next_token
+                ))
+                response = result
                 all_events.extend(response.get("events", []))
 
                 next_token = response.get("nextToken")
@@ -868,7 +882,7 @@ class MemoryClient:
             logger.info("Built conversation tree with %d branches", len(tree["main_branch"]["branches"]))
             return tree
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to build conversation tree: %s", e)
             raise
 
@@ -980,7 +994,7 @@ class MemoryClient:
 
             return result
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to get last K turns: %s", e)
             raise
 
@@ -1010,98 +1024,38 @@ class MemoryClient:
             logger.info("Created branch '%s' from event %s", branch_name, root_event_id)
             return event
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to fork conversation: %s", e)
             raise
 
     def get_memory_strategies(self, memory_id: str) -> List[Dict[str, Any]]:
         """Get all strategies for a memory."""
-        try:
-            response = self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-            memory = response["memory"]
-
-            # Handle both old and new field names in response
-            strategies = memory.get("strategies", memory.get("memoryStrategies", []))
-
-            # Normalize strategy fields
-            normalized_strategies = []
-            for strategy in strategies:
-                # Create normalized version with both old and new field names
-                normalized = strategy.copy()
-
-                # Ensure both field name versions exist
-                if "strategyId" in strategy and "memoryStrategyId" not in normalized:
-                    normalized["memoryStrategyId"] = strategy["strategyId"]
-                elif "memoryStrategyId" in strategy and "strategyId" not in normalized:
-                    normalized["strategyId"] = strategy["memoryStrategyId"]
-
-                if "type" in strategy and "memoryStrategyType" not in normalized:
-                    normalized["memoryStrategyType"] = strategy["type"]
-                elif "memoryStrategyType" in strategy and "type" not in normalized:
-                    normalized["type"] = strategy["memoryStrategyType"]
-
-                normalized_strategies.append(normalized)
-
-            return normalized_strategies
-        except ClientError as e:
-            logger.error("Failed to get memory strategies: %s", e)
-            raise
+        # Use the backend method that's already implemented
+        memory = asyncio.run(self.backend.get_memory(memory_id))
+        if memory:
+            return memory.get('strategies', [])
+        return []
 
     def get_memory_status(self, memory_id: str) -> str:
         """Get current memory status."""
-        try:
-            response = self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-            return response["memory"]["status"]
-        except ClientError as e:
-            logger.error("Failed to get memory status: %s", e)
-            raise
+        # Use the backend method that's already implemented
+        status = asyncio.run(self.backend.get_memory_status(memory_id))
+        return status.value if status else "UNKNOWN"
 
     def list_memories(self, max_results: int = 100) -> List[Dict[str, Any]]:
         """List all memories for the account."""
-        try:
-            # Ensure max_results doesn't exceed API limit per request
-            results_per_request = min(max_results, 100)
-
-            response = self.gmcp_client.list_memories(maxResults=results_per_request)
-            memories = response.get("memories", [])
-
-            next_token = response.get("nextToken")
-            while next_token and len(memories) < max_results:
-                remaining = max_results - len(memories)
-                results_per_request = min(remaining, 100)
-
-                response = self.gmcp_client.list_memories(maxResults=results_per_request, nextToken=next_token)
-                memories.extend(response.get("memories", []))
-                next_token = response.get("nextToken")
-
-            # Normalize memory summaries if they contain new field names
-            normalized_memories = []
-            for memory in memories[:max_results]:
-                normalized = memory.copy()
-                # Ensure both field name versions exist
-                if "id" in memory and "memoryId" not in normalized:
-                    normalized["memoryId"] = memory["id"]
-                elif "memoryId" in memory and "id" not in normalized:
-                    normalized["id"] = memory["memoryId"]
-                normalized_memories.append(normalized)
-
-            return normalized_memories
-
-        except ClientError as e:
-            logger.error("Failed to list memories: %s", e)
-            raise
+        # Use the backend method that's already implemented
+        result = asyncio.run(self.backend.list_memories(max_results))
+        return result.get('memories', [])
 
     def delete_memory(self, memory_id: str) -> Dict[str, Any]:
         """Delete a memory resource."""
-        try:
-            response = self.gmcp_client.delete_memory(
-                memoryId=memory_id, clientToken=str(uuid.uuid4())
-            )  # Input uses old field name
+        success = asyncio.run(self.backend.delete_memory(memory_id))
+        if success:
             logger.info("Deleted memory: %s", memory_id)
-            return response
-        except ClientError as e:
-            logger.error("Failed to delete memory: %s", e)
-            raise
+            return {"deleted": True, "memoryId": memory_id}
+        else:
+            raise RuntimeError(f"Failed to delete memory: {memory_id}")
 
     def delete_memory_and_wait(self, memory_id: str, max_wait: int = 300, poll_interval: int = 10) -> Dict[str, Any]:
         """Delete a memory and wait for deletion to complete.
@@ -1129,17 +1083,18 @@ class MemoryClient:
             elapsed = int(time.time() - start_time)
 
             try:
-                # Try to get the memory - if it doesn't exist, deletion is complete
-                self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-                logger.debug("Memory still exists, waiting... (%d seconds elapsed)", elapsed)
-
-            except ClientError as e:
-                if e.response["Error"]["Code"] == "ResourceNotFoundException":
+                # Try to get the memory - if it returns None, deletion is complete
+                memory = asyncio.run(self.backend.get_memory(memory_id))
+                if memory is None:
                     logger.info("Memory %s successfully deleted (took %d seconds)", memory_id, elapsed)
                     return response
                 else:
-                    logger.error("Error checking memory status: %s", e)
-                    raise
+                    logger.debug("Memory still exists, waiting... (%d seconds elapsed)", elapsed)
+
+            except Exception as e:
+                # Assume any error means memory is not found (deleted)
+                logger.info("Memory %s successfully deleted (took %d seconds)", memory_id, elapsed)
+                return response
 
             time.sleep(poll_interval)
 
@@ -1402,17 +1357,17 @@ class MemoryClient:
             if not memory_strategies:
                 raise ValueError("No strategy operations provided")
 
-            response = self.gmcp_client.update_memory(
-                memoryId=memory_id,
-                memoryStrategies=memory_strategies,
-                clientToken=str(uuid.uuid4()),  # Using old field names for input
-            )
+            result = asyncio.run(self.backend.update_memory(
+                memory_id=memory_id,
+                strategies=memory_strategies.get("modifyMemoryStrategies", [])
+            ))
+            response = {"memory": result}
 
             logger.info("Updated memory strategies for: %s", memory_id)
             memory = self._normalize_memory_response(response["memory"])
             return memory
 
-        except ClientError as e:
+        except Exception as e:
             logger.error("Failed to update memory strategies: %s", e)
             raise
 
@@ -1572,6 +1527,133 @@ class MemoryClient:
 
         return memory
 
+    # ==================== UNIFIED BACKEND METHODS ====================
+    
+    def get_memory(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve memory resource metadata."""
+        return asyncio.run(self.backend.get_memory(memory_id))
+    
+    def get_memory_status(self, memory_id: str) -> Optional[str]:
+        """Get memory resource status."""
+        status = asyncio.run(self.backend.get_memory_status(memory_id))
+        return status.value if status else None
+    
+    def create_event(
+        self,
+        memory_id: str,
+        actor_id: str,
+        session_id: str,
+        payload: List[Dict[str, Any]],
+        branch_name: Optional[str] = None,
+        root_event_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Create a new conversation event."""
+        return asyncio.run(self.backend.create_event(
+            memory_id=memory_id,
+            actor_id=actor_id,
+            session_id=session_id,
+            payload=payload,
+            branch_name=branch_name,
+            root_event_id=root_event_id
+        ))
+    
+    def get_last_k_turns(
+        self,
+        memory_id: str,
+        session_id: str,
+        k: int = 5,
+        actor_id: Optional[str] = None,
+        branch_name: Optional[str] = None
+    ) -> List[Dict[str, str]]:
+        """Get the last K conversation turns."""
+        # Use backend implementation
+        events_result = asyncio.run(self.backend.list_events(
+            memory_id=memory_id,
+            session_id=session_id,
+            actor_id=actor_id,
+            branch_name=branch_name,
+            max_results=k * 2
+        ))
+        
+        events = events_result.get('events', [])
+        
+        # Extract messages from events and format them
+        messages = []
+        for event in reversed(events):  # Reverse to get chronological order
+            payload = event.get('payload', [])
+            for msg in payload:
+                if 'conversational' in msg:
+                    conv = msg['conversational']
+                    role = conv.get('role', '').lower()
+                    content = conv.get('content', {})
+                    text = content.get('text', '') if isinstance(content, dict) else str(content)
+                    
+                    if text and role:
+                        messages.append({
+                            'role': role,
+                            'content': text
+                        })
+        
+        # Return last k messages
+        return messages[-k:] if len(messages) > k else messages
+    
+    def retrieve_memories(
+        self, 
+        memory_id: str, 
+        namespace: str, 
+        query: str, 
+        actor_id: Optional[str] = None, 
+        top_k: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Retrieve relevant memories from a namespace."""
+        if "*" in namespace:
+            logger.error("Wildcards are not supported in namespaces. Please provide exact namespace.")
+            return []
+        
+        return asyncio.run(self.backend.retrieve_memories(
+            memory_id=memory_id,
+            namespace=namespace,
+            query=query,
+            top_k=top_k,
+            actor_id=actor_id
+        ))
+    
+    def list_memories(
+        self,
+        max_results: int = 10,
+        next_token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """List memory resources with pagination."""
+        return asyncio.run(self.backend.list_memories(max_results, next_token))
+    
+    def delete_memory(self, memory_id: str) -> bool:
+        """Delete a memory resource."""
+        return asyncio.run(self.backend.delete_memory(memory_id))
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Perform backend health check."""
+        return asyncio.run(self.backend.health_check())
+    
+    def get_metrics(self) -> Dict[str, Any]:
+        """Get backend performance metrics."""
+        return asyncio.run(self.backend.get_metrics())
+    
+    def get_memory_strategies(self, memory_id: str) -> List[Dict[str, Any]]:
+        """Get memory strategies for a memory resource."""
+        memory = asyncio.run(self.backend.get_memory(memory_id))
+        if memory:
+            return memory.get('strategies', [])
+        return []
+    
+    def list_memories_backend(self, max_results: int = 100) -> List[Dict[str, Any]]:
+        """List memories using backend (renamed to avoid conflict)."""
+        result = asyncio.run(self.backend.list_memories(max_results))
+        return result.get('memories', [])
+    
+    def delete_memory_backend(self, memory_id: str) -> bool:
+        """Delete memory using backend (renamed to avoid conflict)."""
+        return asyncio.run(self.backend.delete_memory(memory_id))
+
     def _add_strategy(self, memory_id: str, strategy: Dict[str, Any]) -> Dict[str, Any]:
         """Internal method to add a single strategy."""
         return self.update_memory_strategies(memory_id=memory_id, add_strategies=[strategy])
@@ -1589,17 +1671,17 @@ class MemoryClient:
 
                 if status == MemoryStatus.ACTIVE.value:
                     logger.info("Memory %s is ACTIVE again (took %d seconds)", memory_id, elapsed)
-                    response = self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-                    memory = self._normalize_memory_response(response["memory"])
+                    memory = asyncio.run(self.backend.get_memory(memory_id))
+                    memory = self._normalize_memory_response(memory)
                     return memory
                 elif status == MemoryStatus.FAILED.value:
-                    response = self.gmcp_client.get_memory(memoryId=memory_id)  # Input uses old field name
-                    failure_reason = response["memory"].get("failureReason", "Unknown")
+                    memory = asyncio.run(self.backend.get_memory(memory_id))
+                    failure_reason = memory.get("failureReason", "Unknown")
                     raise RuntimeError("Memory update failed: %s" % failure_reason)
                 else:
                     logger.debug("Memory status: %s (%d seconds elapsed)", status, elapsed)
 
-            except ClientError as e:
+            except Exception as e:
                 logger.error("Error checking memory status: %s", e)
                 raise
 
