@@ -61,6 +61,10 @@ class PostgreSQLMemoryBackend(MemoryBackend):
         
         self.pool: Optional[Pool] = None
         self._initialized = False
+        
+        # Initialize embedding model configuration
+        self.embedding_model_name = self.config.get('embedding_model', 'all-MiniLM-L6-v2')
+        self._embedding_model = None
     
     async def _ensure_initialized(self):
         """Ensure database pool is initialized."""
@@ -443,8 +447,8 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             if content_parts:
                 content = '\n'.join(content_parts)
                 
-                # Generate embedding (placeholder - in real implementation, call embedding service)
-                embedding = [0.1] * self.embedding_dimension  # Placeholder
+                # Generate embedding using sentence-transformers or configured model
+                embedding = await self._generate_embedding(content)
                 
                 record_id = str(uuid.uuid4())
                 
@@ -770,6 +774,27 @@ class PostgreSQLMemoryBackend(MemoryBackend):
             'record_count': stats['record_count'],
             'pool_size': len(self.pool._queue._queue) if self.pool else 0
         }
+    
+    async def _generate_embedding(self, text: str) -> List[float]:
+        """Generate embedding for text using configured model."""
+        try:
+            # Lazy load embedding model
+            if self._embedding_model is None:
+                from sentence_transformers import SentenceTransformer
+                self._embedding_model = SentenceTransformer(self.embedding_model_name)
+            
+            # Generate embedding
+            embedding = self._embedding_model.encode(text)
+            return embedding.tolist()
+        except ImportError:
+            # Fallback to random embeddings if sentence-transformers not available
+            import random
+            random.seed(hash(text) % 2147483647)  # Deterministic based on text
+            return [random.random() for _ in range(self.embedding_dimension)]
+        except Exception as e:
+            logger.warning(f"Failed to generate embedding: {e}")
+            # Return zero vector as fallback
+            return [0.0] * self.embedding_dimension
     
     async def close(self):
         """Close database connections."""

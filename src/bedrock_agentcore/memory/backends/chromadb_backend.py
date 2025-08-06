@@ -407,14 +407,29 @@ class ChromaDBMemoryBackend(MemoryBackend):
         ids = []
         
         for strategy in strategies:
-            # Handle nested strategy structure
-            if 'semanticMemoryStrategy' in strategy:
-                strategy_config = strategy['semanticMemoryStrategy']
-                strategy_type = 'semantic'
-            elif 'summaryMemoryStrategy' in strategy:
-                strategy_config = strategy['summaryMemoryStrategy']
-                strategy_type = 'summary'
-            else:
+            # Handle nested strategy structure using StrategyType enum
+            strategy_config = None
+            strategy_type = None
+            
+            for strategy_key in strategy.keys():
+                if strategy_key == StrategyType.SEMANTIC.value:
+                    strategy_config = strategy[strategy_key]
+                    strategy_type = 'semantic'
+                    break
+                elif strategy_key == StrategyType.SUMMARY.value:
+                    strategy_config = strategy[strategy_key]
+                    strategy_type = 'summary'
+                    break
+                elif strategy_key == StrategyType.USER_PREFERENCE.value:
+                    strategy_config = strategy[strategy_key]
+                    strategy_type = 'user_preference'
+                    break
+                elif strategy_key == StrategyType.CUSTOM.value:
+                    strategy_config = strategy[strategy_key]
+                    strategy_type = 'custom'
+                    break
+            
+            if not strategy_config:
                 continue
                 
             # Get namespace templates from the strategy config
